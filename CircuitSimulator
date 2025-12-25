@@ -1,0 +1,846 @@
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { 
+  Trash2, Zap, RotateCw, Rocket, GraduationCap, 
+  ZoomIn, ZoomOut, Move, PanelLeftClose, PanelLeftOpen,
+  CheckCircle2, XCircle, Grid, Undo
+} from 'lucide-react';
+
+// --- 1. Constants & Types ---
+
+type NodeType = 'SWITCH' | 'BULB' | 'AND' | 'OR' | 'NOT' | 'XOR' | 'HALF_ADDER' | 'FULL_ADDER';
+type InteractionState = 'IDLE' | 'PANNING' | 'DRAGGING' | 'WIRING';
+
+interface NodeData {
+  id: string;
+  type: NodeType;
+  x: number;
+  y: number;
+  rotation: number;
+  inputs: boolean[];
+  outputs: boolean[];
+}
+
+interface Connection {
+  id: string;
+  fromNodeId: string;
+  fromPort: number;
+  toNodeId: string;
+  toPort: number;
+}
+
+// History Snapshot Type
+interface HistoryState {
+  nodes: NodeData[];
+  connections: Connection[];
+}
+
+const COMPONENT_CONFIG: Record<NodeType, { inputs: number; outputs: number; color: string; label: string; cost: number }> = {
+  SWITCH: { inputs: 0, outputs: 1, color: '#2563eb', label: '스위치', cost: 150 },
+  BULB: { inputs: 1, outputs: 0, color: '#ca8a04', label: '전구', cost: 50 },
+  AND: { inputs: 2, outputs: 1, color: '#dc2626', label: 'AND', cost: 100 },
+  OR: { inputs: 2, outputs: 1, color: '#16a34a', label: 'OR', cost: 100 },
+  NOT: { inputs: 1, outputs: 1, color: '#ea580c', label: 'NOT', cost: 100 },
+  XOR: { inputs: 2, outputs: 1, color: '#9333ea', label: 'XOR', cost: 300 },
+  HALF_ADDER: { inputs: 2, outputs: 2, color: '#0891b2', label: '반가산기', cost: 500 },
+  FULL_ADDER: { inputs: 3, outputs: 2, color: '#4f46e5', label: '전가산기', cost: 2000 },
+};
+
+const CONSTANTS = {
+  NODE_WIDTH: 90,
+  NODE_HEIGHT: 70,
+  PORT_R: 12,
+  SNAP_DIST: 40,
+};
+
+// --- 2. Logic Engine ---
+
+const evaluateNode = (type: NodeType, inputs: boolean[]): boolean[] => {
+  const [a, b, c] = inputs;
+  switch (type) {
+    case 'SWITCH': return [false]; // State managed by click
+    case 'BULB': return [];
+    case 'AND': return [a && b];
+    case 'OR': return [a || b];
+    case 'NOT': return [!a];
+    case 'XOR': return [(!!a) !== (!!b)];
+    case 'HALF_ADDER': return [(!!a) !== (!!b), a && b];
+    case 'FULL_ADDER': {
+      const ax = !!a, bx = !!b, cx = !!c;
+      const sum = (ax !== bx) !== cx;
+      const cout = (ax && bx) || (cx && (ax !== bx));
+      return [sum, cout];
+    }
+    default: return [];
+  }
+};
+
+const getPortPos = (node: NodeData, type: 'input' | 'output', index: number) => {
+  const { inputs, outputs } = COMPONENT_CONFIG[node.type];
+  const count = type === 'input' ? inputs : outputs;
+  
+  let lx = type === 'input' ? 0 : CONSTANTS.NODE_WIDTH;
+  let ly = (CONSTANTS.NODE_HEIGHT / (count + 1)) * (index + 1);
+
+  if (node.type === 'FULL_ADDER' && type === 'input') {
+    if (index === 2) {
+      lx = CONSTANTS.NODE_WIDTH / 2;
+      ly = 0;
+    } else {
+      ly = (CONSTANTS.NODE_HEIGHT / 3) * (index + 1);
+    }
+  }
+
+  const cx = CONSTANTS.NODE_WIDTH / 2;
+  const cy = CONSTANTS.NODE_HEIGHT / 2;
+  const rad = (node.rotation * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+
+  return {
+    x: node.x + cx + (lx - cx) * cos - (ly - cy) * sin,
+    y: node.y + cy + (lx - cx) * sin + (ly - cy) * cos
+  };
+};
+
+// --- 3. Node Component ---
+
+const NodeItem = React.memo(({ 
+  node, isDragging, onPointerDown, onPortDown 
+}: { 
+  node: NodeData, 
+  isDragging: boolean,
+  onPointerDown: (e: React.PointerEvent, id: string) => void,
+  onPortDown: (e: React.PointerEvent, nodeId: string, index: number) => void
+}) => {
+  const config = COMPONENT_CONFIG[node.type];
+  const isOn = node.outputs[0];
+
+  return (
+    <div
+      className="absolute touch-none select-none pointer-events-auto cursor-grab active:cursor-grabbing"
+      style={{
+        left: node.x, top: node.y,
+        width: CONSTANTS.NODE_WIDTH, height: CONSTANTS.NODE_HEIGHT,
+        transform: `rotate(${node.rotation}deg) scale(${isDragging ? 1.1 : 1})`,
+        zIndex: isDragging ? 100 : 20,
+        transition: isDragging ? 'none' : 'transform 0.1s',
+      }}
+      onPointerDown={(e) => onPointerDown(e, node.id)}
+    >
+      {/* Node Body */}
+      <div className={`
+          w-full h-full border-2 shadow-sm flex items-center justify-center relative
+          ${node.type === 'SWITCH' || node.type === 'BULB' ? 'rounded-full' : 'rounded-lg'}
+          ${isDragging ? 'border-blue-500 shadow-xl' : 'border-slate-300 bg-white'}
+          ${node.type === 'BULB' ? (node.inputs[0] ? 'bg-yellow-100 border-yellow-400 shadow-[0_0_20px_rgba(250,204,21,0.6)]' : 'bg-slate-200 border-slate-300') : 'bg-white'}
+        `}>
+        
+        {/* Visuals */}
+        {node.type === 'SWITCH' && (
+          <div className={`w-12 h-6 rounded-full transition-colors flex items-center px-1 ${isOn ? 'bg-blue-500 justify-end' : 'bg-slate-200 justify-start'}`}>
+            <div className="w-4 h-4 bg-white rounded-full shadow-sm" />
+          </div>
+        )}
+        {node.type !== 'SWITCH' && node.type !== 'BULB' && (
+          <div className="flex flex-col items-center pointer-events-none">
+            <span className="font-bold text-sm" style={{ color: config.color }}>{config.label}</span>
+            {['HALF_ADDER', 'FULL_ADDER'].includes(node.type) && (
+               <div className="flex gap-1 mt-1">
+                 <div className={`w-1.5 h-1.5 rounded-full ${node.outputs[0] ? 'bg-green-500' : 'bg-slate-200'}`} />
+                 <div className={`w-1.5 h-1.5 rounded-full ${node.outputs[1] ? 'bg-green-500' : 'bg-slate-200'}`} />
+               </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Ports Overlay */}
+      <div className="absolute inset-0">
+        {/* Inputs */}
+        {new Array(config.inputs).fill(0).map((_, i) => {
+           let top = ((i + 1) * 100) / (config.inputs + 1);
+           let left = 0;
+           let label = '';
+           let labelClass = "absolute -top-5 left-1/2 -translate-x-1/2"; 
+
+           if(node.type === 'FULL_ADDER') {
+             if (i === 2) { 
+               top = 0; left = 50; label = 'Cin'; 
+             } else {
+               top = ((i + 1) * 100) / 3;
+               label = i === 0 ? 'A' : 'B';
+               labelClass = "absolute top-1/2 -translate-y-1/2 right-4";
+             }
+           }
+           else if(node.type === 'HALF_ADDER') {
+             label = i===0?'A':'B';
+             labelClass = "absolute top-1/2 -translate-y-1/2 right-4";
+           }
+
+           return (
+             <div key={`in-${i}`} className="absolute w-4 h-4 -translate-x-1/2 -translate-y-1/2 pointer-events-none" style={{ top: `${top}%`, left: `${left}%` }}>
+               <div className={`w-full h-full rounded-full border-2 bg-white ${node.inputs[i] ? 'border-green-500 bg-green-50' : 'border-slate-400'}`} />
+               {label && (
+                 <span className={`${labelClass} text-[10px] font-bold text-slate-500 pointer-events-none whitespace-nowrap`}>
+                   {label}
+                 </span>
+               )}
+             </div>
+           );
+        })}
+        {/* Outputs */}
+        {node.type !== 'BULB' && new Array(config.outputs).fill(0).map((_, i) => {
+           const top = ((i + 1) * 100) / (config.outputs + 1);
+           let label = '';
+           let labelClass = "absolute -top-5 left-1/2 -translate-x-1/2";
+
+           if(node.type === 'HALF_ADDER' || node.type === 'FULL_ADDER') {
+             label = i===0?'S':'C';
+             labelClass = "absolute top-1/2 -translate-y-1/2 left-8";
+           }
+
+           return (
+             <div 
+               key={`out-${i}`} 
+               className="absolute w-12 h-12 -translate-y-1/2 translate-x-1/4 flex items-center justify-center cursor-crosshair touch-none pointer-events-auto"
+               style={{ top: `${top}%`, right: -10 }}
+               onPointerDown={(e) => onPortDown(e, node.id, i)}
+             >
+               <div className={`w-4 h-4 rounded-full border-2 bg-white pointer-events-none ${node.outputs[i] ? 'bg-green-500 border-green-600' : 'border-slate-400'}`} />
+               {label && (
+                 <span className={`${labelClass} text-[10px] font-bold text-slate-500 pointer-events-none whitespace-nowrap`}>
+                   {label}
+                 </span>
+               )}
+             </div>
+           );
+        })}
+      </div>
+    </div>
+  );
+}, (prev, next) => prev.node === next.node && prev.isDragging === next.isDragging);
+
+
+// --- 4. Main App ---
+
+export default function App() {
+  const [mode, setMode] = useState<'ASSIGNMENT' | 'LESSON'>('LESSON');
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  
+  const [nodes, setNodes] = useState<NodeData[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  
+  // History
+  const [history, setHistory] = useState<HistoryState[]>([]);
+  
+  const [cameraState, setCameraState] = useState({ x: 0, y: 0, z: 1 });
+  const cameraRef = useRef({ x: 0, y: 0, z: 1 });
+  
+  const updateCamera = (newState: { x: number, y: number, z: number } | ((prev: typeof cameraState) => typeof cameraState)) => {
+    if (typeof newState === 'function') {
+      setCameraState(prev => {
+        const next = newState(prev);
+        cameraRef.current = next;
+        return next;
+      });
+    } else {
+      cameraRef.current = newState;
+      setCameraState(newState);
+    }
+  };
+
+  const [interaction, setInteraction] = useState<InteractionState>('IDLE');
+  
+  const [activeId, setActiveId] = useState<string | null>(null); // Selected Node ID
+  const [selectedWireId, setSelectedWireId] = useState<string | null>(null); // Selected Wire ID
+
+  const [wireStart, setWireStart] = useState<{ nodeId: string, index: number } | null>(null);
+  const [tempWirePos, setTempWirePos] = useState<{ x: number, y: number } | null>(null);
+  const [snapTarget, setSnapTarget] = useState<{ nodeId: string, index: number } | null>(null);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pointers = useRef<Map<number, { x: number, y: number }>>(new Map());
+  const prevPinchDist = useRef<number | null>(null);
+  const dragStartRef = useRef<{ x: number, y: number } | null>(null); 
+  const itemStartRef = useRef<{ x: number, y: number } | null>(null); 
+
+  // Initialize
+  useEffect(() => {
+    if (containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        updateCamera({ x: rect.width / 2, y: rect.height / 2, z: 1 });
+    }
+  }, []);
+
+  // History
+  const saveHistory = useCallback(() => {
+    setHistory(prev => {
+      const newHistory = [...prev, { nodes: JSON.parse(JSON.stringify(nodes)), connections: [...connections] }];
+      if (newHistory.length > 20) newHistory.shift(); 
+      return newHistory;
+    });
+  }, [nodes, connections]);
+
+  const undo = () => {
+    if (history.length === 0) return;
+    const previous = history[history.length - 1];
+    setNodes(previous.nodes);
+    setConnections(previous.connections);
+    setHistory(prev => prev.slice(0, -1));
+    setActiveId(null);
+    setSelectedWireId(null);
+  };
+
+  // Logic Loop
+  useEffect(() => {
+    const loop = setInterval(() => {
+      setNodes(currNodes => {
+        let changed = false;
+        const nextNodes = [...currNodes];
+        const nodeMap = new Map(nextNodes.map((n, i) => [n.id, i]));
+        const wireMap = new Map<string, boolean>();
+
+        connections.forEach(conn => {
+          const fromIdx = nodeMap.get(conn.fromNodeId);
+          if (fromIdx === undefined) return;
+          const val = nextNodes[fromIdx].outputs[conn.fromPort] || false;
+          wireMap.set(`${conn.toNodeId}-${conn.toPort}`, val);
+        });
+
+        nextNodes.forEach((node, idx) => {
+          if (node.type === 'SWITCH') return;
+
+          const config = COMPONENT_CONFIG[node.type];
+          let inputChanged = false;
+          const nextInputs = [...node.inputs];
+          
+          for (let i = 0; i < config.inputs; i++) {
+            const val = wireMap.get(`${node.id}-${i}`) || false;
+            if (nextInputs[i] !== val) {
+              nextInputs[i] = val;
+              inputChanged = true;
+            }
+          }
+
+          if (inputChanged) {
+            nextNodes[idx] = { ...node, inputs: nextInputs };
+            changed = true;
+          }
+
+          const nextOutputs = evaluateNode(node.type, nextNodes[idx].inputs);
+          
+          let outputChanged = false;
+          if (node.outputs.length !== nextOutputs.length) outputChanged = true;
+          else {
+            for(let i=0; i<nextOutputs.length; i++) {
+              if (node.outputs[i] !== nextOutputs[i]) { outputChanged = true; break; }
+            }
+          }
+
+          if (outputChanged) {
+            nextNodes[idx] = { ...nextNodes[idx], outputs: nextOutputs };
+            changed = true;
+          }
+        });
+
+        return changed ? nextNodes : currNodes;
+      });
+    }, 50);
+    return () => clearInterval(loop);
+  }, [connections]);
+
+  const screenToWorld = (sx: number, sy: number) => {
+    if (!containerRef.current) return { x: 0, y: 0 };
+    const rect = containerRef.current.getBoundingClientRect();
+    const cam = cameraRef.current;
+    return {
+      x: (sx - rect.left - cam.x) / cam.z,
+      y: (sy - rect.top - cam.y) / cam.z
+    };
+  };
+
+  // --- Handlers ---
+
+  const handleWheel = (e: React.WheelEvent) => {
+    e.stopPropagation();
+    const delta = -e.deltaY * 0.001; 
+    const currentZ = cameraRef.current.z;
+    const newZ = Math.min(Math.max(currentZ * (1 + delta), 0.3), 4);
+    
+    const rect = containerRef.current!.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    
+    const scaleRatio = newZ / currentZ;
+    
+    const newX = mouseX - (mouseX - cameraRef.current.x) * scaleRatio;
+    const newY = mouseY - (mouseY - cameraRef.current.y) * scaleRatio;
+    
+    updateCamera({ x: newX, y: newY, z: newZ });
+  };
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    const target = e.target as HTMLElement;
+    
+    // Only drag pan if clicking background
+    if (target.id === 'canvas-layer' || target.id === 'world-layer') {
+        pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        e.currentTarget.setPointerCapture(e.pointerId);
+
+        if (pointers.current.size === 2) {
+            const pts = Array.from(pointers.current.values());
+            const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+            prevPinchDist.current = dist;
+            setInteraction('PANNING');
+            return;
+        }
+
+        if (pointers.current.size === 1) {
+            setInteraction('PANNING');
+            dragStartRef.current = { x: e.clientX, y: e.clientY };
+            itemStartRef.current = { x: cameraRef.current.x, y: cameraRef.current.y };
+            
+            // Clear selections on background click
+            setActiveId(null);
+            setSelectedWireId(null);
+        }
+    }
+  };
+
+  const handleNodePointerDown = (e: React.PointerEvent, id: string) => {
+    e.stopPropagation();
+    saveHistory(); 
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    
+    setInteraction('DRAGGING');
+    setActiveId(id);
+    setSelectedWireId(null); // Clear wire selection
+    dragStartRef.current = { x: e.clientX, y: e.clientY };
+    
+    const node = nodes.find(n => n.id === id);
+    if (node) {
+      itemStartRef.current = { x: node.x, y: node.y };
+    }
+  };
+
+  const handlePortPointerDown = (e: React.PointerEvent, nodeId: string, index: number) => {
+    e.stopPropagation();
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    
+    setInteraction('WIRING');
+    setActiveId(null); 
+    setSelectedWireId(null);
+    setWireStart({ nodeId, index });
+    
+    const node = nodes.find(n => n.id === nodeId);
+    if (node) {
+      const pos = getPortPos(node, 'output', index);
+      setTempWirePos(pos);
+    }
+  };
+
+  const handleWireClick = (e: React.PointerEvent, connId: string) => {
+      e.stopPropagation();
+      setSelectedWireId(connId);
+      setActiveId(null);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!pointers.current.has(e.pointerId)) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    const rect = containerRef.current!.getBoundingClientRect();
+
+    if (interaction === 'PANNING') {
+      if (pointers.current.size === 2) {
+        // Pinch Zoom
+        const pts = Array.from(pointers.current.values());
+        const newDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        
+        if (prevPinchDist.current && Math.abs(newDist - prevPinchDist.current) > 2) {
+          const scaleChange = newDist / prevPinchDist.current;
+          const cx = (pts[0].x + pts[1].x) / 2;
+          const cy = (pts[0].y + pts[1].y) / 2;
+          
+          updateCamera(prev => {
+            const newZ = Math.min(Math.max(prev.z * scaleChange, 0.3), 4);
+            const actualRatio = newZ / prev.z;
+            
+            const rcx = cx - rect.left;
+            const rcy = cy - rect.top;
+            const newX = rcx - (rcx - prev.x) * actualRatio;
+            const newY = rcy - (rcy - prev.y) * actualRatio;
+            
+            return { x: newX, y: newY, z: newZ };
+          });
+          
+          prevPinchDist.current = newDist;
+        }
+      } else if (pointers.current.size === 1 && dragStartRef.current && itemStartRef.current) {
+        // Pan
+        const dx = e.clientX - dragStartRef.current.x;
+        const dy = e.clientY - dragStartRef.current.y;
+        updateCamera({
+          ...cameraRef.current,
+          x: itemStartRef.current.x + dx,
+          y: itemStartRef.current.y + dy
+        });
+      }
+    }
+
+    if (interaction === 'DRAGGING' && activeId && dragStartRef.current && itemStartRef.current) {
+      const dx = (e.clientX - dragStartRef.current.x) / cameraRef.current.z;
+      const dy = (e.clientY - dragStartRef.current.y) / cameraRef.current.z;
+      setNodes(prev => prev.map(n => {
+        if (n.id === activeId) {
+          return { ...n, x: itemStartRef.current!.x + dx, y: itemStartRef.current!.y + dy };
+        }
+        return n;
+      }));
+    }
+
+    if (interaction === 'WIRING') {
+      const worldPos = screenToWorld(e.clientX, e.clientY);
+      setTempWirePos(worldPos);
+
+      // Snap logic
+      let closest: { nodeId: string, index: number, dist: number } | null = null;
+      nodes.forEach(node => {
+        if (node.id === wireStart?.nodeId) return;
+        const conf = COMPONENT_CONFIG[node.type];
+        const inputCount = node.type === 'FULL_ADDER' ? 3 : conf.inputs;
+        
+        for (let i = 0; i < inputCount; i++) {
+          const p = getPortPos(node, 'input', i);
+          const dist = Math.hypot(worldPos.x - p.x, worldPos.y - p.y);
+          if (dist < CONSTANTS.SNAP_DIST) {
+            if (!closest || dist < closest.dist) {
+              closest = { nodeId: node.id, index: i, dist };
+            }
+          }
+        }
+      });
+      setSnapTarget(closest ? { nodeId: closest.nodeId, index: closest.index } : null);
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    pointers.current.delete(e.pointerId);
+
+    if (interaction === 'PANNING' && pointers.current.size === 1) {
+      const p = pointers.current.values().next().value;
+      dragStartRef.current = { x: p.x, y: p.y };
+      itemStartRef.current = { x: cameraRef.current.x, y: cameraRef.current.y };
+    }
+
+    if (interaction === 'DRAGGING' && activeId) {
+      if (dragStartRef.current && 
+          Math.hypot(e.clientX - dragStartRef.current.x, e.clientY - dragStartRef.current.y) < 5) {
+        toggleSwitch(activeId);
+      }
+    }
+
+    if (interaction === 'WIRING' && wireStart && snapTarget) {
+      saveHistory(); 
+      setConnections(prev => [
+        ...prev.filter(c => !(c.toNodeId === snapTarget.nodeId && c.toPort === snapTarget.index)),
+        {
+          id: Date.now().toString(),
+          fromNodeId: wireStart.nodeId,
+          fromPort: wireStart.index,
+          toNodeId: snapTarget.nodeId,
+          toPort: snapTarget.index
+        }
+      ]);
+    }
+
+    if (pointers.current.size === 0) {
+      setInteraction('IDLE');
+      setWireStart(null);
+      setTempWirePos(null);
+      setSnapTarget(null);
+      prevPinchDist.current = null;
+    }
+  };
+
+  const deleteSelected = () => {
+      saveHistory();
+      if (activeId) {
+          setNodes(prev => prev.filter(n => n.id !== activeId));
+          setConnections(prev => prev.filter(c => c.fromNodeId !== activeId && c.toNodeId !== activeId));
+          setActiveId(null);
+      } else if (selectedWireId) {
+          setConnections(prev => prev.filter(c => c.id !== selectedWireId));
+          setSelectedWireId(null);
+      }
+  };
+
+  // --- Actions ---
+
+  const zoomButton = (delta: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    
+    updateCamera(prev => {
+        const newZ = Math.min(Math.max(prev.z + delta, 0.3), 4);
+        const ratio = newZ / prev.z;
+        const rcx = cx - rect.left;
+        const rcy = cy - rect.top;
+        const newX = rcx - (rcx - prev.x) * ratio;
+        const newY = rcy - (rcy - prev.y) * ratio;
+        return { x: newX, y: newY, z: newZ };
+    });
+  };
+
+  const addNode = (type: NodeType) => {
+    saveHistory(); 
+    const rect = containerRef.current?.getBoundingClientRect();
+    if(!rect) return;
+    const center = screenToWorld(rect.left + rect.width/2, rect.top + rect.height/2);
+    const jitter = (Math.random() - 0.5) * 50;
+    
+    setNodes(prev => [...prev, {
+      id: Date.now().toString(),
+      type,
+      x: center.x - CONSTANTS.NODE_WIDTH/2 + jitter,
+      y: center.y - CONSTANTS.NODE_HEIGHT/2 + jitter,
+      rotation: 0,
+      inputs: Array(COMPONENT_CONFIG[type].inputs).fill(false),
+      outputs: Array(COMPONENT_CONFIG[type].outputs).fill(false)
+    }]);
+  };
+
+  const toggleSwitch = (id: string) => {
+    setNodes(prev => prev.map(n => {
+      if (n.id === id && n.type === 'SWITCH') {
+        return { ...n, outputs: [!n.outputs[0]] };
+      }
+      return n;
+    }));
+  };
+
+  const rotateNode = () => {
+    if (!activeId) return;
+    saveHistory();
+    setNodes(prev => prev.map(n => n.id === activeId ? { ...n, rotation: (n.rotation + 90) % 360 } : n));
+  };
+
+  const renderWire = (conn: Connection, active: boolean) => {
+    const fromNode = nodes.find(n => n.id === conn.fromNodeId);
+    const toNode = nodes.find(n => n.id === conn.toNodeId);
+    if (!fromNode || !toNode) return null;
+    
+    const p1 = getPortPos(fromNode, 'output', conn.fromPort);
+    const p2 = getPortPos(toNode, 'input', conn.toPort);
+
+    const dist = Math.abs(p2.x - p1.x);
+    const cp = Math.max(dist * 0.5, 50);
+    const path = `M ${p1.x} ${p1.y} C ${p1.x + cp} ${p1.y}, ${p2.x - cp} ${p2.y}, ${p2.x} ${p2.y}`;
+    const isSelected = conn.id === selectedWireId;
+    
+    return (
+      <g key={conn.id} onClick={(e) => { e.stopPropagation(); /* React click might be captured by pointer events */ }}>
+        {/* Glow */}
+        {active && <path d={path} stroke="#4ade80" strokeWidth="8" fill="none" opacity="0.4" pointerEvents="none" />}
+        
+        {/* Visible Wire */}
+        <path 
+            d={path} 
+            stroke={isSelected ? "#eab308" : (active ? "#22c55e" : "#94a3b8")} 
+            strokeWidth={isSelected ? "6" : "4"} 
+            fill="none" 
+            pointerEvents="none"
+        />
+        
+        {/* Hit Area (Invisible but clickable) */}
+        <path 
+          d={path} 
+          stroke="transparent" 
+          strokeWidth="20" 
+          fill="none" 
+          cursor="pointer"
+          pointerEvents="stroke"
+          onPointerDown={(e) => {
+              handleWireClick(e, conn.id);
+          }}
+        />
+      </g>
+    );
+  };
+
+  const renderTempWire = () => {
+      if (!wireStart || !tempWirePos) return null;
+      const fromNode = nodes.find(n => n.id === wireStart.nodeId);
+      if(!fromNode) return null;
+      const p1 = getPortPos(fromNode, 'output', wireStart.index);
+      
+      const dist = Math.abs(tempWirePos.x - p1.x);
+      const cp = Math.max(dist * 0.5, 50);
+      const path = `M ${p1.x} ${p1.y} C ${p1.x + cp} ${p1.y}, ${tempWirePos.x - cp} ${tempWirePos.y}, ${tempWirePos.x} ${tempWirePos.y}`;
+
+      return (
+        <path 
+          d={path} 
+          stroke={snapTarget ? "#22c55e" : "#cbd5e1"} 
+          strokeWidth="4" 
+          strokeDasharray={snapTarget ? "0" : "8 4"}
+          fill="none" 
+          pointerEvents="none"
+        />
+      );
+  };
+
+  const totalCost = nodes.reduce((sum, n) => sum + COMPONENT_CONFIG[n.type].cost, 0);
+
+  return (
+    <div className="flex flex-col h-screen bg-slate-100 font-sans select-none overflow-hidden touch-none">
+      
+      {/* Header */}
+      <header className="flex items-center justify-between px-4 py-3 bg-white shadow-sm z-30 shrink-0">
+        <div className="flex items-center gap-3">
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-2 hover:bg-slate-100 rounded-lg text-slate-600">
+            {sidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}
+          </button>
+          <div className="flex items-center gap-2">
+            <div className={`p-2 rounded-lg ${mode === 'ASSIGNMENT' ? 'bg-orange-500' : 'bg-indigo-500'}`}>
+              <Zap className="w-5 h-5 text-white" fill="currentColor" />
+            </div>
+            <div>
+              <h1 className="font-bold text-lg leading-tight hidden sm:block">{mode === 'ASSIGNMENT' ? '화성 탐사선 회로 시뮬레이터' : '논리회로 실험실'}</h1>
+              <h1 className="font-bold text-lg leading-tight sm:hidden">화성 회로 Sim</h1>
+            </div>
+          </div>
+        </div>
+        
+        <div className="flex items-center gap-2">
+          {/* Undo Button */}
+          <button 
+            onClick={undo}
+            disabled={history.length === 0}
+            className={`p-2 rounded-lg ${history.length > 0 ? 'text-slate-700 hover:bg-slate-100' : 'text-slate-300'}`}
+            title="실행 취소"
+          >
+            <Undo size={20} />
+          </button>
+
+          <div className="flex bg-slate-100 p-1 rounded-lg mr-2">
+             <button onClick={() => setMode('LESSON')} className={`p-1.5 rounded-md ${mode === 'LESSON' ? 'bg-white shadow' : 'text-slate-400'}`}><GraduationCap size={18} /></button>
+             <button onClick={() => setMode('ASSIGNMENT')} className={`p-1.5 rounded-md ${mode === 'ASSIGNMENT' ? 'bg-white shadow' : 'text-slate-400'}`}><Rocket size={18} /></button>
+          </div>
+
+          {mode === 'ASSIGNMENT' && (
+            <div className="flex flex-col items-end mr-2">
+              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider hidden sm:block">비용</span>
+              <span className="font-mono font-bold text-lg text-green-600">₩{totalCost.toLocaleString()}</span>
+            </div>
+          )}
+          <button 
+            onClick={() => { if(confirm('초기화?')) { saveHistory(); setNodes([]); setConnections([]); } }}
+            className="p-2 bg-red-50 text-red-600 rounded-lg hover:bg-red-100"
+          >
+            <Trash2 size={20} />
+          </button>
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden relative">
+        <aside className={`bg-white border-r border-slate-200 z-10 flex flex-col transition-all duration-300 ${sidebarOpen ? 'w-20 sm:w-64 translate-x-0' : 'w-0 -translate-x-full opacity-0 overflow-hidden'}`}>
+          <div className="p-4 overflow-y-auto h-full">
+            <div className="grid grid-cols-1 gap-3">
+              {(Object.keys(COMPONENT_CONFIG) as NodeType[]).map(type => (
+                <button
+                  key={type}
+                  onClick={() => addNode(type)}
+                  className="flex items-center gap-3 p-3 rounded-xl border border-slate-200 hover:border-blue-400 hover:bg-blue-50 transition-all active:scale-95 bg-white shadow-sm"
+                >
+                  <div className="w-10 h-10 rounded-lg flex items-center justify-center text-white font-bold shrink-0" style={{ backgroundColor: COMPONENT_CONFIG[type].color }}>
+                    {type === 'SWITCH' ? 'S' : type === 'BULB' ? 'B' : type === 'HALF_ADDER' ? 'HA' : type === 'FULL_ADDER' ? 'FA' : type.slice(0,2)}
+                  </div>
+                  <div className="flex flex-col items-start overflow-hidden">
+                    <span className="font-bold text-slate-700 text-sm truncate w-full text-left">{COMPONENT_CONFIG[type].label}</span>
+                    {mode === 'ASSIGNMENT' && <span className="text-xs text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded mt-1">₩{COMPONENT_CONFIG[type].cost}</span>}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </aside>
+
+        <div 
+          ref={containerRef}
+          className="flex-1 relative bg-slate-50 cursor-crosshair overflow-hidden touch-none"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onWheel={handleWheel} 
+        >
+          <div 
+            id="canvas-layer"
+            className="absolute inset-0 z-0 pointer-events-auto"
+            style={{
+              backgroundImage: 'radial-gradient(#94a3b8 1px, transparent 1px)',
+              backgroundSize: `${20 * cameraState.z}px ${20 * cameraState.z}px`,
+              backgroundPosition: `${cameraState.x}px ${cameraState.y}px`,
+              opacity: 0.3
+            }}
+          />
+
+          <div className="absolute bottom-6 right-6 flex flex-col gap-2 z-20 pointer-events-auto">
+            <button onClick={() => zoomButton(0.2)} className="p-3 bg-white shadow-lg rounded-full text-slate-600"><ZoomIn /></button>
+            <button onClick={() => zoomButton(-0.2)} className="p-3 bg-white shadow-lg rounded-full text-slate-600"><ZoomOut /></button>
+          </div>
+
+          {/* Context Menu for Nodes OR Wires */}
+          {(activeId || selectedWireId) && interaction === 'IDLE' && (
+            <div 
+              className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4 bg-white px-6 py-3 rounded-full shadow-xl z-30 animate-in slide-in-from-bottom-4 pointer-events-auto border border-slate-100"
+              onPointerDown={(e) => e.stopPropagation()} 
+            >
+               {activeId && (
+                 <>
+                   <button onClick={rotateNode} className="flex flex-col items-center gap-1 text-slate-600 hover:text-blue-600">
+                     <RotateCw size={20} />
+                     <span className="text-[10px] font-bold">회전</span>
+                   </button>
+                   <div className="w-px h-8 bg-slate-200"></div>
+                 </>
+               )}
+               <button onClick={deleteSelected} className="flex flex-col items-center gap-1 text-slate-600 hover:text-red-600">
+                 <Trash2 size={20} />
+                 <span className="text-[10px] font-bold">{selectedWireId ? '선 삭제' : '삭제'}</span>
+               </button>
+            </div>
+          )}
+
+          <div 
+            id="world-layer"
+            className="absolute inset-0 origin-top-left pointer-events-none"
+            style={{ transform: `translate(${cameraState.x}px, ${cameraState.y}px) scale(${cameraState.z})` }}
+          >
+            <svg className="absolute overflow-visible top-0 left-0 w-full h-full" style={{ zIndex: 10 }}>
+              {connections.map(conn => renderWire(conn, !!nodes.find(n => n.id === conn.fromNodeId)?.outputs[conn.fromPort]))}
+              {renderTempWire()}
+            </svg>
+
+            {nodes.map(node => (
+              <NodeItem
+                key={node.id}
+                node={node}
+                isDragging={interaction === 'DRAGGING' && activeId === node.id}
+                onPointerDown={handleNodePointerDown}
+                onPortDown={handlePortPointerDown}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
